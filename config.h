@@ -14,6 +14,7 @@
 
  */
 
+
 #ifndef _HAVE_CONFIG_H
 #define _HAVE_CONFIG_H
 
@@ -21,7 +22,7 @@
 
 /* Version string: */
 
-#define VERSION             "2.51b"
+#define VERSION             "2.51b-ijon"
 
 /******************************************************
  *                                                    *
@@ -103,13 +104,17 @@
    ranges has a 33% probability of getting picked, except for the first
    two cycles where smaller blocks are favored: */
 
-#define HAVOC_BLK_SMALL     32
-#define HAVOC_BLK_MEDIUM    128
-#define HAVOC_BLK_LARGE     1500
+//#define HAVOC_BLK_SMALL     32
+#define HAVOC_BLK_SMALL     8
+//#define HAVOC_BLK_MEDIUM    128
+#define HAVOC_BLK_MEDIUM    32
+//#define HAVOC_BLK_LARGE     1500
+#define HAVOC_BLK_LARGE     512
 
 /* Extra-large blocks, selected very rarely (<5% of the time): */
 
-#define HAVOC_BLK_XL        32768
+//#define HAVOC_BLK_XL        32768
+#define HAVOC_BLK_XL        512
 
 /* Probabilities of skipping non-favored entries in the queue, expressed as
    percentages: */
@@ -120,7 +125,7 @@
 
 /* Splicing cycle count: */
 
-#define SPLICE_CYCLES       15
+#define SPLICE_CYCLES       8
 
 /* Nominal per-splice havoc cycle length: */
 
@@ -140,6 +145,7 @@
 /* Maximum size of input file, in bytes (keep under 100MB): */
 
 #define MAX_FILE            (1 * 1024 * 1024)
+//#define MAX_FILE            (2 * 1024)
 
 /* The same, for the test case minimizer: */
 
@@ -193,7 +199,7 @@
 
 /* Fuzzer stats file and plot update intervals (sec): */
 
-#define STATS_UPDATE_SEC    60
+#define STATS_UPDATE_SEC    1
 #define PLOT_UPDATE_SEC     5
 
 /* Smoothing divisor for CPU load and exec speed stats (1 - no smoothing). */
@@ -315,6 +321,14 @@
 
 #define MAP_SIZE_POW2       16
 #define MAP_SIZE            (1 << MAP_SIZE_POW2)
+#define MAXMAP_SIZE            (512)
+
+typedef struct{
+  u8  afl_area[MAP_SIZE];
+  uint64_t afl_max[MAXMAP_SIZE];
+  uint8_t is_selected;
+} shared_data_t;
+
 
 /* Maximum allocator request size (keep well under INT_MAX): */
 
@@ -346,5 +360,6 @@
    measuring coverage that could be attained by a "dumb" fuzzing algorithm: */
 
 // #define IGNORE_FINDS
+
 
 #endif /* ! _HAVE_CONFIG_H */

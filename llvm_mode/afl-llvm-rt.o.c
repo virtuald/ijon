@@ -21,6 +21,7 @@
 
 #include "../config.h"
 #include "../types.h"
+#include "afl-rt.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -34,6 +35,9 @@
 #include <sys/wait.h>
 #include <sys/types.h>
 
+#include <stddef.h>
+#include <execinfo.h>
+
 /* This is a somewhat ugly hack for the experimental 'trace-pc-guard' mode.
    Basically, we need to make sure that the forkserver is initialized after
    the LLVM-generated runtime initialization pass, not before. */
@@ -45,6 +49,7 @@
 #endif /* ^USE_TRACE_PC */
 
 
+
 /* Globals needed by the injected instrumentation. The __afl_area_initial region
    is used for instrumentation output before __afl_map_shm() has a chance to run.
    It will end up as .comm, so it shouldn't be too wasteful. */
@@ -52,8 +57,121 @@
 u8  __afl_area_initial[MAP_SIZE];
 u8* __afl_area_ptr = __afl_area_initial;
 
-__thread u32 __afl_prev_loc;
+uint64_t  __afl_max_initial[MAXMAP_SIZE];
+uint64_t* __afl_max_ptr = __afl_max_initial;
 
+
+shared_data_t* shared_data = NULL;
+
+__thread u32 __afl_prev_loc;
+__thread u32 __afl_state;
+__thread u32 __afl_state_log;
+__thread u32 __afl_mask = 0xffffffff;
+
+void ijon_xor_state(uint32_t val){
+  __afl_state = (__afl_state^val)%MAP_SIZE;
+}
+
+void ijon_push_state(uint32_t x){
+  ijon_xor_state(__afl_state_log);
+  __afl_state_log = (__afl_state_log << 8) | (x & 0xff);
+  ijon_xor_state(__afl_state_log);
+}
+
+void ijon_max(uint32_t addr, uint64_t val){
+  if(__afl_max_ptr[addr%MAXMAP_SIZE] < val) {
+    __afl_max_ptr[addr%MAXMAP_SIZE] = val;
+  }
+}
+
+void ijon_min(uint32_t addr, uint64_t val){
+  val = 0xffffffffffffffff-val;
+  ijon_max(addr, val);
+}
+
+
+void ijon_map_inc(uint32_t addr){ 
+  __afl_area_ptr[(__afl_state^addr)%MAP_SIZE]+=1;
+}
+
+void ijon_map_set(uint32_t addr){ 
+  __afl_area_ptr[(__afl_state^addr)%MAP_SIZE]|=1;
+}
+
+uint32_t ijon_strdist(char* a,char* b){
+  int i = 0;
+  while(*a && *b && *a++==*b++){
+    i++;
+  }
+  return i;
+}
+
+uint32_t ijon_memdist(char* a,char* b, size_t len){
+  int i = 0;
+  while(i < len && *a++==*b++){
+    i++;
+  }
+  return i;
+}
+
+uint64_t ijon_simple_hash(uint64_t x) {
+    x = (x ^ (x >> 30)) * UINT64_C(0xbf58476d1ce4e5b9);
+    x = (x ^ (x >> 27)) * UINT64_C(0x94d049bb133111eb);
+    x = x ^ (x >> 31);
+    return x;
+}
+
+void ijon_enable_feedback(){
+	__afl_mask = 0xffffffff;
+}
+void ijon_disable_feedback(){
+	__afl_mask = 0x0;
+}
+
+uint32_t ijon_hashint(uint32_t old, uint32_t val){
+  uint64_t input = (((uint64_t)(old))<<32) | ((uint64_t)(val));
+  return (uint32_t)(ijon_simple_hash(input));
+}
+uint32_t ijon_hashstr(uint32_t old, char* val){
+  return ijon_hashmem(old, val, strlen(val));
+}
+uint32_t ijon_hashmem(uint32_t old, char* val, size_t len){
+  old = ijon_hashint(old,len);
+  for(size_t i = 0; i < len ; i++){
+    old = ijon_hashint(old, val[i]);
+  }
+  return old;
+}
+
+#ifdef __i386__
+//WHY IS STACKUNWINDING NOT WORKING IN CGC BINARIES?
+uint32_t ijon_hashstack_manual(){
+	uint32_t *ebp=0;
+	uint64_t res = 0;
+	asm("\t movl %%ebp,%0" : "=r"(ebp));
+	for(int i=0; i<16 && ebp; i++){
+		//printf("ebp: %p\n", ebp);
+		printf("ret: %x\n", ebp[1]);
+		res ^= ijon_simple_hash((uint64_t)ebp[1]);
+		ebp = (uint32_t*)ebp[0];
+	}
+ printf(">>>> Final Stackhash: %lx\n",res);
+	return (uint32_t)res;
+}
+#endif
+
+uint32_t ijon_hashstack_libgcc(){
+ void* buffer[16] = {0,};
+ int num = backtrace (buffer, 16);
+ assert(num<16);
+ uint64_t res = 0;
+ for(int i =0; i < num; i++) {
+	 printf("stack_frame %p\n", buffer[i]);
+	 res ^= ijon_simple_hash((uint64_t)buffer[i]);
+ }
+ printf(">>>> Final Stackhash: %lx\n",res);
+ return (uint32_t)res;
+}
 
 /* Running in persistent mode? */
 
@@ -74,11 +192,15 @@ static void __afl_map_shm(void) {
 
     u32 shm_id = atoi(id_str);
 
-    __afl_area_ptr = shmat(shm_id, NULL, 0);
+    shared_data = shmat(shm_id, NULL, 0);
+
+    if (shared_data == (void *)-1) _exit(1);
+
+    __afl_area_ptr = &shared_data->afl_area[0];
+    __afl_max_ptr = &shared_data->afl_max[0];
 
     /* Whooooops. */
 
-    if (__afl_area_ptr == (void *)-1) _exit(1);
 
     /* Write something into the bitmap so that even with low AFL_INST_RATIO,
        our parent doesn't give up on us. */
@@ -188,8 +310,12 @@ int __afl_persistent_loop(unsigned int max_cnt) {
     if (is_persistent) {
 
       memset(__afl_area_ptr, 0, MAP_SIZE);
+      memset(__afl_max_ptr, 0, MAXMAP_SIZE*sizeof(uint64_t));
       __afl_area_ptr[0] = 1;
       __afl_prev_loc = 0;
+      __afl_state = 0;
+			__afl_mask = 0xffffffff;
+      __afl_state_log = 0;
     }
 
     cycle_cnt  = max_cnt;
@@ -206,6 +332,9 @@ int __afl_persistent_loop(unsigned int max_cnt) {
 
       __afl_area_ptr[0] = 1;
       __afl_prev_loc = 0;
+      __afl_state = 0;
+			__afl_mask = 0xffffffff;
+      __afl_state_log = 0;
 
       return 1;
 

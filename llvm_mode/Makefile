@@ -23,18 +23,20 @@ BIN_PATH     = $(PREFIX)/bin
 VERSION     = $(shell grep '^\#define VERSION ' ../config.h | cut -d '"' -f2)
 
 LLVM_CONFIG ?= llvm-config
+LLVM_BINDIR = $(shell $(LLVM_CONFIG) --bindir 2>/dev/null)
 
 CFLAGS      ?= -O3 -funroll-loops
 CFLAGS      += -Wall -D_FORTIFY_SOURCE=2 -g -Wno-pointer-sign \
                -DAFL_PATH=\"$(HELPER_PATH)\" -DBIN_PATH=\"$(BIN_PATH)\" \
-               -DVERSION=\"$(VERSION)\" 
+               -DLLVM_BINDIR=\"$(LLVM_BINDIR)\" -DVERSION=\"$(VERSION)\" 
 ifdef AFL_TRACE_PC
   CFLAGS    += -DUSE_TRACE_PC=1
 endif
 
 CXXFLAGS    ?= -O3 -funroll-loops
 CXXFLAGS    += -Wall -D_FORTIFY_SOURCE=2 -g -Wno-pointer-sign \
-               -DVERSION=\"$(VERSION)\" -Wno-variadic-macros
+               -DLLVM_BINDIR=\"$(LLVM_BINDIR)\" -DVERSION=\"$(VERSION)\" \
+               -Wno-variadic-macros
 
 CLANG_CFL    = `$(LLVM_CONFIG) --cxxflags` -fno-rtti -fpic $(CXXFLAGS)
 CLANG_LFL    = `$(LLVM_CONFIG) --ldflags` $(LDFLAGS)
@@ -55,9 +57,9 @@ ifeq "$(origin CC)" "default"
 endif
 
 ifndef AFL_TRACE_PC
-  PROGS      = ../afl-clang-fast ../afl-llvm-pass.so ../afl-llvm-rt.o ../afl-llvm-rt-32.o ../afl-llvm-rt-64.o
+  PROGS      = ../afl-clang-fast ../afl-llvm-pass.so ../afl-llvm-rt.o ../afl-llvm-rt-32.o ../afl-llvm-rt-64.o #../compare-transform-pass.so ../split-compares-pass.so ../split-switches-pass.so
 else
-  PROGS      = ../afl-clang-fast ../afl-llvm-rt.o ../afl-llvm-rt-32.o ../afl-llvm-rt-64.o
+  PROGS      = ../afl-clang-fast ../afl-llvm-rt.o ../afl-llvm-rt-32.o ../afl-llvm-rt-64.o #../compare-transform-pass.so ../split-compares-pass.so ../split-switches-pass.so
 endif
 
 all: test_deps $(PROGS) test_build all_done
@@ -80,6 +82,15 @@ endif
 	ln -sf afl-clang-fast ../afl-clang-fast++
 
 ../afl-llvm-pass.so: afl-llvm-pass.so.cc | test_deps
+	$(CXX) $(CLANG_CFL) -shared $< -o $@ $(CLANG_LFL)
+
+../split-switches-pass.so: split-switches-pass.so.cc | test_deps
+	$(CXX) $(CLANG_CFL) -shared $< -o $@ $(CLANG_LFL)
+
+../compare-transform-pass.so: compare-transform-pass.so.cc | test_deps
+	$(CXX) $(CLANG_CFL) -shared $< -o $@ $(CLANG_LFL)
+
+../split-compares-pass.so: split-compares-pass.so.cc | test_deps
 	$(CXX) $(CLANG_CFL) -shared $< -o $@ $(CLANG_LFL)
 
 ../afl-llvm-rt.o: afl-llvm-rt.o.c | test_deps

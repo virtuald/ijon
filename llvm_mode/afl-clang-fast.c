@@ -32,11 +32,13 @@
 #include <unistd.h>
 #include <stdlib.h>
 #include <string.h>
+#include <assert.h>
+#include <limits.h>
 
 static u8*  obj_path;               /* Path to runtime libraries         */
 static u8** cc_params;              /* Parameters passed to the real CC  */
 static u32  cc_par_cnt = 1;         /* Param count, including argv0      */
-
+static u8   llvm_fullpath[PATH_MAX];
 
 /* Try to find the runtime libraries. If that fails, abort. */
 
@@ -96,8 +98,11 @@ static void find_obj(u8* argv0) {
 
 static void edit_params(u32 argc, char** argv) {
 
-  u8 fortify_set = 0, asan_set = 0, x_set = 0, maybe_linking = 1, bit_mode = 0;
+  u8 fortify_set = 0, asan_set = 0, x_set = 0, maybe_linking = 1, bit_mode = 0,
+     has_llvm_config = 0, compiling_asm = 0;
   u8 *name;
+  
+  has_llvm_config = (strlen(LLVM_BINDIR) > 0);
 
   cc_params = ck_alloc((argc + 128) * sizeof(u8*));
 
@@ -105,11 +110,23 @@ static void edit_params(u32 argc, char** argv) {
   if (!name) name = argv[0]; else name++;
 
   if (!strcmp(name, "afl-clang-fast++")) {
-    u8* alt_cxx = getenv("AFL_CXX");
-    cc_params[0] = alt_cxx ? alt_cxx : (u8*)"clang++";
+
+    u8 *alt_cxx = getenv("AFL_CXX");
+    if (has_llvm_config)
+      snprintf(llvm_fullpath, sizeof(llvm_fullpath), "%s/clang++", LLVM_BINDIR);
+    else
+      sprintf(llvm_fullpath, "clang++");
+    cc_params[0] = alt_cxx ? alt_cxx : (u8 *)llvm_fullpath;
+
   } else {
-    u8* alt_cc = getenv("AFL_CC");
-    cc_params[0] = alt_cc ? alt_cc : (u8*)"clang";
+
+    u8 *alt_cc = getenv("AFL_CC");
+    if (has_llvm_config)
+      snprintf(llvm_fullpath, sizeof(llvm_fullpath), "%s/clang", LLVM_BINDIR);
+    else
+      sprintf(llvm_fullpath, "clang");
+    cc_params[0] = alt_cc ? alt_cc : (u8 *)llvm_fullpath;
+
   }
 
   /* There are two ways to compile afl-clang-fast. In the traditional mode, we
@@ -123,11 +140,36 @@ static void edit_params(u32 argc, char** argv) {
   cc_params[cc_par_cnt++] = "-fsanitize-coverage=trace-pc-guard";
   cc_params[cc_par_cnt++] = "-mllvm";
   cc_params[cc_par_cnt++] = "-sanitizer-coverage-block-threshold=0";
+  assert(false);
 #else
   cc_params[cc_par_cnt++] = "-Xclang";
   cc_params[cc_par_cnt++] = "-load";
   cc_params[cc_par_cnt++] = "-Xclang";
   cc_params[cc_par_cnt++] = alloc_printf("%s/afl-llvm-pass.so", obj_path);
+
+  if (getenv("LAF_SPLIT_SWITCHES")) {
+    cc_params[cc_par_cnt++] = "-Xclang";
+    cc_params[cc_par_cnt++] = "-load";
+    cc_params[cc_par_cnt++] = "-Xclang";
+    cc_params[cc_par_cnt++] = alloc_printf("%s/split-switches-pass.so", obj_path);
+  }
+
+  if (getenv("LAF_TRANSFORM_COMPARES")) {
+    cc_params[cc_par_cnt++] = "-Xclang";
+    cc_params[cc_par_cnt++] = "-load";
+    cc_params[cc_par_cnt++] = "-Xclang";
+    cc_params[cc_par_cnt++] = alloc_printf("%s/compare-transform-pass.so", obj_path);
+  }
+
+  if (getenv("LAF_SPLIT_COMPARES")) {
+    cc_params[cc_par_cnt++] = "-Xclang";
+    cc_params[cc_par_cnt++] = "-load";
+    cc_params[cc_par_cnt++] = "-Xclang";
+    cc_params[cc_par_cnt++] = alloc_printf("%s/split-compares-pass.so", obj_path);
+  }
+	cc_params[cc_par_cnt++] = alloc_printf("-include%s/llvm_mode/afl-rt.h", obj_path);
+  cc_params[cc_par_cnt++] = "-D_USE_IJON";
+  //cc_params[cc_par_cnt++] = "-includeafl-rt.h";
 #endif /* ^USE_TRACE_PC */
 
   cc_params[cc_par_cnt++] = "-Qunused-arguments";
@@ -147,6 +189,11 @@ static void edit_params(u32 argc, char** argv) {
     if (!strcmp(cur, "-c") || !strcmp(cur, "-S") || !strcmp(cur, "-E"))
       maybe_linking = 0;
 
+		if(strlen(cur)>2 && cur[strlen(cur)-1]=='S' && cur[strlen(cur)-2]=='.'){
+			printf("found compiling asm!\n");
+			compiling_asm = 1;
+		}
+
     if (!strcmp(cur, "-fsanitize=address") ||
         !strcmp(cur, "-fsanitize=memory")) asan_set = 1;
 
@@ -160,7 +207,9 @@ static void edit_params(u32 argc, char** argv) {
     cc_params[cc_par_cnt++] = cur;
 
   }
-
+	if(compiling_asm){
+			cc_params[cc_par_cnt++] = "-D_NO_IJON_IN_ASM";
+	}
   if (getenv("AFL_HARDEN")) {
 
     cc_params[cc_par_cnt++] = "-fstack-protector-all";
@@ -169,6 +218,9 @@ static void edit_params(u32 argc, char** argv) {
       cc_params[cc_par_cnt++] = "-D_FORTIFY_SOURCE=2";
 
   }
+
+  cc_params[cc_par_cnt++] = "-fno-omit-frame-pointer";
+  cc_params[cc_par_cnt++] = "-rdynamic";
 
   if (!asan_set) {
 
@@ -348,7 +400,12 @@ int main(int argc, char** argv) {
   find_obj(argv[0]);
 
   edit_params(argc, argv);
-
+  int i = 0;
+  while(cc_params[i]){
+    printf("%s ", cc_params[i]);
+    i++;
+  }
+  printf("\n");
   execvp(cc_params[0], (char**)cc_params);
 
   FATAL("Oops, failed to execute '%s' - check your PATH", cc_params[0]);

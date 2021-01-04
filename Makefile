@@ -69,8 +69,14 @@ afl-as: afl-as.c afl-as.h $(COMM_HDR) | test_x86
 	$(CC) $(CFLAGS) $@.c -o $@ $(LDFLAGS)
 	ln -sf afl-as as
 
-afl-fuzz: afl-fuzz.c $(COMM_HDR) | test_x86
-	$(CC) $(CFLAGS) $@.c -o $@ $(LDFLAGS)
+afl-fuzz.o: afl-fuzz.c $(COMM_HDR) | test_x86
+	$(CC) $(CFLAGS) -c afl-fuzz.c -o $@ 
+
+afl-ijon-min.o: afl-ijon-min.c $(COMM_HDR) | test_x86
+	$(CC) $(CFLAGS) -c afl-ijon-min.c  -o $@
+
+afl-fuzz: afl-fuzz.o afl-ijon-min.o $(COMM_HDR) | test_x86
+	$(CC) $(CFLAGS) -g afl-fuzz.o afl-ijon-min.o -o $@ $(LDFLAGS)
 
 afl-showmap: afl-showmap.c $(COMM_HDR) | test_x86
 	$(CC) $(CFLAGS) $@.c -o $@ $(LDFLAGS)

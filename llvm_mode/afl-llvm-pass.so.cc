@@ -49,6 +49,28 @@ namespace {
       static char ID;
       AFLCoverage() : ModulePass(ID) { }
 
+      // ripped from aflgo
+      static bool isBlacklisted(const Function *F) {
+
+        static const char *Blacklist[] = {
+
+            "asan.",
+            "llvm.",
+            "sancov.",
+            "__ubsan_handle_",
+
+        };
+
+        for (auto const &BlacklistFunc : Blacklist) {
+
+          if (F->getName().startswith(BlacklistFunc)) { return true; }
+
+        }
+
+        return false;
+
+      }
+
       bool runOnModule(Module &M) override;
 
       // StringRef getPassName() const override {
@@ -92,6 +114,9 @@ bool AFLCoverage::runOnModule(Module &M) {
       FATAL("Bad value of AFL_INST_RATIO (must be between 1 and 100)");
 
   }
+	if(inst_ratio == 1){
+		inst_ratio = 0;
+	}
 
   /* Get globals for the SHM region and the previous location. Note that
      __afl_prev_loc is thread-local. */
@@ -104,11 +129,21 @@ bool AFLCoverage::runOnModule(Module &M) {
       M, Int32Ty, false, GlobalValue::ExternalLinkage, 0, "__afl_prev_loc",
       0, GlobalVariable::GeneralDynamicTLSModel, 0, false);
 
+  GlobalVariable *AFLState = new GlobalVariable(
+      M, Int32Ty, false, GlobalValue::ExternalLinkage, 0, "__afl_state",
+      0, GlobalVariable::GeneralDynamicTLSModel, 0, false);
+
+  GlobalVariable *AFLMask = new GlobalVariable(
+      M, Int32Ty, false, GlobalValue::ExternalLinkage, 0, "__afl_mask",
+      0, GlobalVariable::GeneralDynamicTLSModel, 0, false);
   /* Instrument all the things! */
 
   int inst_blocks = 0;
 
-  for (auto &F : M)
+  for (auto &F : M) {
+  
+    if (isBlacklisted(&F)) continue;
+  
     for (auto &BB : F) {
 
       BasicBlock::iterator IP = BB.getFirstInsertionPt();
@@ -122,6 +157,18 @@ bool AFLCoverage::runOnModule(Module &M) {
 
       ConstantInt *CurLoc = ConstantInt::get(Int32Ty, cur_loc);
 
+      /* Load __afl_mask */
+
+      LoadInst *Mask = IRB.CreateLoad(AFLMask);
+      Mask->setMetadata(M.getMDKindID("nosanitize"), MDNode::get(C, None));
+      Value *MaskCasted = IRB.CreateZExt(Mask, IRB.getInt32Ty());
+
+      /* Load __afl_state */
+
+      LoadInst *State = IRB.CreateLoad(AFLState);
+      State->setMetadata(M.getMDKindID("nosanitize"), MDNode::get(C, None));
+      Value *StateCasted = IRB.CreateZExt(State, IRB.getInt32Ty());
+
       /* Load prev_loc */
 
       LoadInst *PrevLoc = IRB.CreateLoad(AFLPrevLoc);
@@ -133,7 +180,7 @@ bool AFLCoverage::runOnModule(Module &M) {
       LoadInst *MapPtr = IRB.CreateLoad(AFLMapPtr);
       MapPtr->setMetadata(M.getMDKindID("nosanitize"), MDNode::get(C, None));
       Value *MapPtrIdx =
-          IRB.CreateGEP(MapPtr, IRB.CreateXor(PrevLocCasted, CurLoc));
+          IRB.CreateGEP(MapPtr, IRB.CreateAnd(MaskCasted,IRB.CreateXor(StateCasted,IRB.CreateXor(PrevLocCasted, CurLoc))));
 
       /* Update bitmap */
 
@@ -152,6 +199,8 @@ bool AFLCoverage::runOnModule(Module &M) {
       inst_blocks++;
 
     }
+    
+  }
 
   /* Say something nice. */
 

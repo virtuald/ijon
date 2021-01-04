@@ -31,6 +31,7 @@
 #include "debug.h"
 #include "alloc-inl.h"
 #include "hash.h"
+#include "afl-ijon-min.h"
 
 #include <stdio.h>
 #include <unistd.h>
@@ -45,6 +46,7 @@
 #include <termios.h>
 #include <dlfcn.h>
 #include <sched.h>
+#include <assert.h>
 
 #include <sys/wait.h>
 #include <sys/time.h>
@@ -84,6 +86,8 @@ EXP_ST u8 *in_dir,                    /* Input directory with test cases  */
           *out_file,                  /* File to fuzz, if any             */
           *out_dir,                   /* Working & output directory       */
           *sync_dir,                  /* Synchronization directory        */
+          *import_dir,                /* Import directory                 */
+          *max_dir,                   /* Ijon Max directory               */
           *sync_id,                   /* Fuzzer ID                        */
           *use_banner,                /* Display banner                   */
           *in_bitmap,                 /* Input bitmap                     */
@@ -132,6 +136,8 @@ static s32 out_fd,                    /* Persistent fd for out_file       */
 static s32 forksrv_pid,               /* PID of the fork server           */
            child_pid = -1,            /* PID of the fuzzed program        */
            out_dir_fd = -1;           /* FD of the lock file              */
+
+shared_data_t* shared_data;
 
 EXP_ST u8* trace_bits;                /* SHM with instrumentation bitmap  */
 
@@ -221,6 +227,8 @@ static s32 cpu_aff = -1;       	      /* Selected CPU core                */
 #endif /* HAVE_AFFINITY */
 
 static FILE* plot_file;               /* Gnuplot output file              */
+
+static ijon_min_state* ijon_state = NULL;
 
 struct queue_entry {
 
@@ -1335,7 +1343,6 @@ static void cull_queue(void) {
 
 }
 
-
 /* Configure shared memory and virgin_bits. This is called at startup. */
 
 EXP_ST void setup_shm(void) {
@@ -1347,7 +1354,7 @@ EXP_ST void setup_shm(void) {
   memset(virgin_tmout, 255, MAP_SIZE);
   memset(virgin_crash, 255, MAP_SIZE);
 
-  shm_id = shmget(IPC_PRIVATE, MAP_SIZE, IPC_CREAT | IPC_EXCL | 0600);
+  shm_id = shmget(IPC_PRIVATE, sizeof(shared_data_t), IPC_CREAT | IPC_EXCL | 0600);
 
   if (shm_id < 0) PFATAL("shmget() failed");
 
@@ -1364,9 +1371,11 @@ EXP_ST void setup_shm(void) {
 
   ck_free(shm_str);
 
-  trace_bits = shmat(shm_id, NULL, 0);
+  shared_data = shmat(shm_id, NULL, 0);
   
-  if (!trace_bits) PFATAL("shmat() failed");
+  if (!shared_data) PFATAL("shmat() failed");
+
+  trace_bits  = &shared_data->afl_area[0];
 
 }
 
@@ -2271,7 +2280,8 @@ static u8 run_target(char** argv, u32 timeout) {
      must prevent any earlier operations from venturing into that
      territory. */
 
-  memset(trace_bits, 0, MAP_SIZE);
+  //memset(trace_bits, 0, MAP_SIZE);
+	memset(shared_data,0,sizeof(shared_data_t));
   MEM_BARRIER();
 
   /* If we're running in "dumb" mode, we can't rely on the fork server
@@ -2465,7 +2475,7 @@ static u8 run_target(char** argv, u32 timeout) {
    truncated. */
 
 static void write_to_testcase(void* mem, u32 len) {
-
+  
   s32 fd = out_fd;
 
   if (out_file) {
@@ -3120,7 +3130,10 @@ static u8 save_if_interesting(char** argv, void* mem, u32 len, u8 fault) {
   s32 fd;
   u8  keeping = 0, res;
 
+
   if (fault == crash_mode) {
+  
+		ijon_update_max(ijon_state, shared_data, mem, len);
 
     /* Keep only if there are new bits in the map, add to queue for
        future fuzzing, etc. */
@@ -4931,12 +4944,14 @@ static u8 could_be_interest(u32 old_val, u32 new_val, u8 blen, u8 check_le) {
 
 static u8 fuzz_one(char** argv) {
 
-  s32 len, fd, temp_len, i, j;
+  s32 len, orig_len, fd, temp_len, i, j;
   u8  *in_buf, *out_buf, *orig_in, *ex_tmp, *eff_map = 0;
   u64 havoc_queued,  orig_hit_cnt, new_hit_cnt;
   u32 splice_cycle = 0, perf_score = 100, orig_perf, prev_cksum, eff_cnt = 1;
 
   u8  ret_val = 1, doing_det = 0;
+
+  u8 is_doing_ijon = 0;
 
   u8  a_collect[MAX_AUTO_EXTRA];
   u32 a_len = 0;
@@ -4948,35 +4963,6 @@ static u8 fuzz_one(char** argv) {
 
   if (queue_cur->depth > 1) return 1;
 
-#else
-
-  if (pending_favored) {
-
-    /* If we have any favored, non-fuzzed new arrivals in the queue,
-       possibly skip to them at the expense of already-fuzzed or non-favored
-       cases. */
-
-    if ((queue_cur->was_fuzzed || !queue_cur->favored) &&
-        UR(100) < SKIP_TO_NEW_PROB) return 1;
-
-  } else if (!dumb_mode && !queue_cur->favored && queued_paths > 10) {
-
-    /* Otherwise, still possibly skip non-favored cases, albeit less often.
-       The odds of skipping stuff are higher for already-fuzzed inputs and
-       lower for never-fuzzed entries. */
-
-    if (queue_cycle > 1 && !queue_cur->was_fuzzed) {
-
-      if (UR(100) < SKIP_NFAV_NEW_PROB) return 1;
-
-    } else {
-
-      if (UR(100) < SKIP_NFAV_OLD_PROB) return 1;
-
-    }
-
-  }
-
 #endif /* ^IGNORE_FINDS */
 
   if (not_on_tty) {
@@ -4985,29 +4971,101 @@ static u8 fuzz_one(char** argv) {
     fflush(stdout);
   }
 
-  /* Map the test case into memory. */
+#ifndef IGNORE_FINDS
 
-  fd = open(queue_cur->fname, O_RDONLY);
+  if(ijon_should_schedule(ijon_state)) {
 
-  if (fd < 0) PFATAL("Unable to open '%s'", queue_cur->fname);
+    printf("scheduled max input!!!!\n");
+    ijon_input_info* info = ijon_get_input(ijon_state);
 
-  len = queue_cur->len;
+    fd = open(info->filename, O_RDONLY);
 
-  orig_in = in_buf = mmap(0, len, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
+    if (fd < 0) PFATAL("Unable to open '%s'", info->filename);
 
-  if (orig_in == MAP_FAILED) PFATAL("Unable to mmap '%s'", queue_cur->fname);
+    len = info->len;
+    orig_len = len;
 
-  close(fd);
+    orig_in = in_buf = mmap(0, len, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
 
-  /* We could mmap() out_buf as MAP_PRIVATE, but we end up clobbering every
-     single byte anyway, so it wouldn't give us any performance or memory usage
-     benefits. */
+    if (orig_in == MAP_FAILED) PFATAL("Unable to mmap '%s'", info->filename);
 
-  out_buf = ck_alloc_nozero(len);
+    close(fd);
 
-  subseq_tmouts = 0;
+    out_buf = ck_alloc_nozero(len);
 
-  cur_depth = queue_cur->depth;
+    memcpy(out_buf, in_buf, len);
+
+    is_doing_ijon = 1;
+
+    orig_perf = perf_score = 100;
+    
+    goto havoc_stage;
+
+  } else {
+  
+      if (pending_favored) {
+
+      /* If we have any favored, non-fuzzed new arrivals in the queue,
+         possibly skip to them at the expense of already-fuzzed or non-favored
+         cases. */
+
+      if ((queue_cur->was_fuzzed || !queue_cur->favored) &&
+          UR(100) < SKIP_TO_NEW_PROB) return 1;
+
+    } else if (!dumb_mode && !queue_cur->favored && queued_paths > 10) {
+
+      /* Otherwise, still possibly skip non-favored cases, albeit less often.
+         The odds of skipping stuff are higher for already-fuzzed inputs and
+         lower for never-fuzzed entries. */
+
+      if (queue_cycle > 1 && !queue_cur->was_fuzzed) {
+
+        if (UR(100) < SKIP_NFAV_NEW_PROB) return 1;
+
+      } else {
+
+        if (UR(100) < SKIP_NFAV_OLD_PROB) return 1;
+
+      }
+
+    }
+  
+#endif /* IGNORE_FINDS */
+
+    printf("scheduled normal input!!!!\n");
+    /* Map the test case into memory. */
+
+    fd = open(queue_cur->fname, O_RDONLY);
+
+    if (fd < 0) PFATAL("Unable to open '%s'", queue_cur->fname);
+
+    len = queue_cur->len;
+    orig_len = len;
+
+    orig_in = in_buf = mmap(0, len, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
+
+
+    if (orig_in == MAP_FAILED) PFATAL("Unable to mmap '%s'", queue_cur->fname);
+
+    close(fd);
+
+    /* We could mmap() out_buf as MAP_PRIVATE, but we end up clobbering every
+       single byte anyway, so it wouldn't give us any performance or memory usage
+       benefits. */
+
+    out_buf = ck_alloc_nozero(len);
+
+    subseq_tmouts = 0;
+
+    cur_depth = queue_cur->depth;
+
+    is_doing_ijon = 0;
+    
+#ifndef IGNORE_FINDS
+    
+  }
+
+#endif /* IGNORE_FINDS */
 
   /*******************************************
    * CALIBRATION (only if failed earlier on) *
@@ -5064,6 +5122,8 @@ static u8 fuzz_one(char** argv) {
    *********************/
 
   orig_perf = perf_score = calculate_score(queue_cur);
+  //printf("perf score: %d\n", perf_score);
+
 
   /* Skip right away if -d is given, if we have done deterministic fuzzing on
      this entry ourselves (was_fuzzed), or if it has gone through deterministic
@@ -6062,8 +6122,12 @@ havoc_stage:
     sprintf(tmp, "splice %u", splice_cycle);
     stage_name  = tmp;
     stage_short = "splice";
-    stage_max   = SPLICE_HAVOC * perf_score / havoc_div / 100;
+    stage_max   = SPLICE_HAVOC * perf_score / havoc_div / 200;
 
+  }
+  if(is_doing_ijon){
+    stage_name  = "ijon-max";
+    stage_short = "ijon-max";
   }
 
   if (stage_max < HAVOC_MIN) stage_max = HAVOC_MIN;
@@ -6265,6 +6329,7 @@ havoc_stage:
             /* Delete bytes. We're making this a bit more likely
                than insertion (the next option) in hopes of keeping
                files reasonably small. */
+						break;
 
             u32 del_from, del_len;
 
@@ -6403,7 +6468,7 @@ havoc_stage:
 
         case 16: {
 
-            u32 use_extra, extra_len, insert_at = UR(temp_len + 1);
+            u32 use_extra, extra_len, insert_at = temp_len; //UR(temp_len+1)
             u8* new_buf;
 
             /* Insert an extra. Do the same dice-rolling stuff as for the
@@ -6506,7 +6571,7 @@ havoc_stage:
 
 retry_splicing:
 
-  if (use_splicing && splice_cycle++ < SPLICE_CYCLES &&
+  if (!is_doing_ijon && use_splicing && splice_cycle++ < SPLICE_CYCLES &&
       queued_paths > 1 && queue_cur->len > 1) {
 
     struct queue_entry* target;
@@ -6520,7 +6585,7 @@ retry_splicing:
     if (in_buf != orig_in) {
       ck_free(in_buf);
       in_buf = orig_in;
-      len = queue_cur->len;
+      len = orig_len;
     }
 
     /* Pick a random queue entry and seek to it. Don't splice with yourself. */
@@ -6593,25 +6658,95 @@ abandon_entry:
 
   /* Update pending_not_fuzzed count if we made it through the calibration
      cycle and have not seen this entry before. */
-
-  if (!stop_soon && !queue_cur->cal_failed && !queue_cur->was_fuzzed) {
-    queue_cur->was_fuzzed = 1;
-    pending_not_fuzzed--;
-    if (queue_cur->favored) pending_favored--;
+  if(!is_doing_ijon){
+    if (!stop_soon && !queue_cur->cal_failed && !queue_cur->was_fuzzed) {
+      queue_cur->was_fuzzed = 1;
+      pending_not_fuzzed--;
+      if (queue_cur->favored) pending_favored--;
+    }
   }
 
-  munmap(orig_in, queue_cur->len);
-
+  munmap(orig_in, orig_len);
+  
   if (in_buf != orig_in) ck_free(in_buf);
   ck_free(out_buf);
   ck_free(eff_map);
-
   return ret_val;
 
 #undef FLIP_BIT
 
 }
 
+
+static void import_files(char** argv) {
+
+  DIR* sd;
+  struct dirent* sd_ent;
+  u32 sync_cnt = 0;
+
+  sd = opendir(import_dir);
+  if (!sd) PFATAL("Unable to open '%s'", import_dir);
+
+  stage_max = stage_cur = 0;
+  cur_depth = 0;
+
+  /* Look at the entries created for every other fuzzer in the sync directory. */
+
+  while ((sd_ent = readdir(sd))) {
+
+    static u8 stage_tmp[128];
+
+    struct dirent* qd_ent;
+    u8 *import_path;
+    u32 min_accept = 0, next_min_accept;
+
+    /* Skip anything that doesn't have a queue/ subdirectory. */
+
+    import_path = alloc_printf("%s/%s", import_dir, sd_ent->d_name);
+
+    s32 fd;
+    struct stat st;
+
+    fd = open(import_path, O_RDONLY);
+
+    if (fd < 0) {
+       ck_free(import_path);
+       continue;
+    }
+
+    if (fstat(fd, &st)) PFATAL("fstat() failed");
+
+    /* Ignore zero-sized or oversized files. */
+
+    if (st.st_size && st.st_size <= MAX_FILE) {
+
+      u8  fault;
+      u8* mem = mmap(0, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+
+      if (mem == MAP_FAILED) PFATAL("Unable to mmap '%s'", import_path);
+
+      /* See what happens. We rely on save_if_interesting() to catch major
+         errors and save the test case. */
+
+      write_to_testcase(mem, st.st_size);
+
+      fault = run_target(argv, exec_tmout);
+
+      syncing_party = sd_ent->d_name;
+      queued_imported += save_if_interesting(argv, mem, st.st_size, fault);
+      syncing_party = 0;
+
+      munmap(mem, st.st_size);
+
+      if (!(stage_cur++ % stats_update_freq)) show_stats();
+    }
+
+    remove(import_path);
+    ck_free(import_path);
+    close(fd);
+  }
+  closedir(sd);
+}
 
 /* Grab interesting test cases from other fuzzers. */
 
@@ -7080,6 +7215,7 @@ EXP_ST void setup_dirs_fds(void) {
   if (sync_id && mkdir(sync_dir, 0700) && errno != EEXIST)
       PFATAL("Unable to create '%s'", sync_dir);
 
+
   if (mkdir(out_dir, 0700)) {
 
     if (errno != EEXIST) PFATAL("Unable to create '%s'", out_dir);
@@ -7101,6 +7237,11 @@ EXP_ST void setup_dirs_fds(void) {
 #endif /* !__sun */
 
   }
+
+  if (mkdir(import_dir, 0700) && errno != EEXIST)
+      PFATAL("Unable to create '%s'", import_dir);
+  if (mkdir(max_dir, 0700) && errno != EEXIST)
+      PFATAL("Unable to create '%s'", max_dir);
 
   /* Queue directory for any starting & discovered paths. */
 
@@ -7894,6 +8035,9 @@ int main(int argc, char** argv) {
   if (!strcmp(in_dir, out_dir))
     FATAL("Input and output directories can't be the same");
 
+  assert(asprintf(&import_dir, "%s/imports", out_dir)>0);
+  assert(asprintf(&max_dir, "%s/ijon_max", out_dir)>0);
+
   if (dumb_mode) {
 
     if (crash_mode) FATAL("-C and -n are mutually exclusive");
@@ -7943,6 +8087,7 @@ int main(int argc, char** argv) {
   init_count_class16();
 
   setup_dirs_fds();
+  ijon_state = new_ijon_min_state(max_dir);
   read_testcases();
   load_auto();
 
